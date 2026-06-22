@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>TUS Trip Boarding Scanner</title>
 <script src="https://unpkg.com/@zxing/library@0.21.3"></script>
+<script src="https://unpkg.com/@zxing/browser@0.1.5"></script>
 <style>
   :root{
     --bg:#0d1117;
@@ -377,49 +378,63 @@ function buildHints(){
 }
 
 async function startCamera(){
+  codeReader = new ZXingBrowser.BrowserMultiFormatReader(buildHints(), { delayBetweenScanAttempts: 100 });
+
+  const onResult = (result, err, controls) => {
+    if(result && !busy){
+      busy = true;
+      handleScan(result.getText().trim());
+    }
+  };
+
+  // Try preferred constraints first (back camera by device label), then fall back
+  // to a simpler facingMode-only constraint if that fails (some iOS Safari versions
+  // reject deviceId:{exact:...} in certain states).
+  let lastErr = null;
+
   try{
-    codeReader = new ZXing.BrowserMultiFormatReader(buildHints(), 100); // scan every ~100ms
-    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
-    // Prefer the back/environment camera
+    const devices = await ZXingBrowser.BrowserCodeReader.listVideoInputDevices();
     let deviceId = devices[0] ? devices[0].deviceId : undefined;
     const backCam = devices.find(d => /back|rear|environment/i.test(d.label));
     if(backCam) deviceId = backCam.deviceId;
 
-    const constraints = {
-      video: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        facingMode: deviceId ? undefined : "environment",
-        width: { ideal: 1280 },
-        height: { ideal: 1280 },
-        focusMode: "continuous"
-      }
-    };
-
-    activeControls = await codeReader.decodeFromConstraints(
-      constraints,
-      video,
-      (result, err, controls) => {
-        if(result && !busy){
-          busy = true;
-          handleScan(result.getText().trim());
-        }
-      }
-    );
-
-    currentStream = video.srcObject;
-    camError.style.display = "none";
-
-    // Show torch button if supported
-    const track = currentStream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if(caps.torch){
-      torchBtn.style.display = "inline-block";
+    if(deviceId){
+      activeControls = await codeReader.decodeFromConstraints(
+        { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 1280 } } },
+        video,
+        onResult
+      );
     }
-
   }catch(err){
+    lastErr = err;
+  }
+
+  if(!activeControls){
+    try{
+      activeControls = await codeReader.decodeFromConstraints(
+        { video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 1280 } } },
+        video,
+        onResult
+      );
+    }catch(err){
+      lastErr = err;
+    }
+  }
+
+  if(!activeControls){
     camError.style.display = "block";
-    camError.textContent = "Camera couldn't start (" + (err.message || err) + "). Use manual entry below.";
+    camError.textContent = "Camera couldn't start" + (lastErr ? " (" + (lastErr.message || lastErr) + ")" : "") + ". Use manual entry below.";
     hintText.style.display = "none";
+    return;
+  }
+
+  currentStream = video.srcObject;
+  camError.style.display = "none";
+
+  const track = currentStream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  if(caps.torch){
+    torchBtn.style.display = "inline-block";
   }
 }
 
