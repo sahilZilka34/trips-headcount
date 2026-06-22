@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>TUS Trip Boarding Scanner</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jsqr/1.4.0/jsQR.min.js"></script>
+<script src="https://unpkg.com/@zxing/library@0.21.3"></script>
 <style>
   :root{
     --bg:#0d1117;
@@ -305,6 +305,7 @@
       <div class="hint" id="hintText">Point the camera at the student's QR code</div>
       <div id="camError">Camera access is needed to scan. Check your browser permissions, or enter the ID manually below.</div>
 
+      <button class="manual-toggle" id="torchBtn" style="display:none;">🔦 Turn on flashlight</button>
       <button class="manual-toggle" id="manualToggleBtn">Enter ID manually instead</button>
       <div id="manualEntry">
         <input id="manualInput" type="text" placeholder="e.g. A00336196" autocapitalize="characters" />
@@ -349,12 +350,14 @@ const manualToggleBtn = document.getElementById('manualToggleBtn');
 const manualEntry = document.getElementById('manualEntry');
 const manualInput = document.getElementById('manualInput');
 const manualSubmit = document.getElementById('manualSubmit');
+const torchBtn = document.getElementById('torchBtn');
 
-let canvas = document.createElement('canvas');
-let ctx = canvas.getContext('2d', { willReadFrequently: true });
-let scanning = false;
-let stream = null;
 let counts = { 'Bus 1':0, 'Bus 2':0, 'Bus 3':0, 'Bus 4':0 };
+let codeReader = null;
+let activeControls = null;
+let currentStream = null;
+let torchOn = false;
+let busy = false; // prevents double-fires while a scan is being processed
 
 function renderCounts(){
   const el = document.getElementById('counts');
@@ -364,45 +367,80 @@ function renderCounts(){
 }
 renderCounts();
 
+// ZXing hints: restrict to QR_CODE only for speed, and allow some tolerance
+function buildHints(){
+  const hints = new Map();
+  const formats = [ZXing.BarcodeFormat.QR_CODE];
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  return hints;
+}
+
 async function startCamera(){
   try{
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment" }
-    });
-    video.srcObject = stream;
-    await video.play();
+    codeReader = new ZXing.BrowserMultiFormatReader(buildHints(), 100); // scan every ~100ms
+    const devices = await ZXing.BrowserCodeReader.listVideoInputDevices();
+    // Prefer the back/environment camera
+    let deviceId = devices[0] ? devices[0].deviceId : undefined;
+    const backCam = devices.find(d => /back|rear|environment/i.test(d.label));
+    if(backCam) deviceId = backCam.deviceId;
+
+    const constraints = {
+      video: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        facingMode: deviceId ? undefined : "environment",
+        width: { ideal: 1280 },
+        height: { ideal: 1280 },
+        focusMode: "continuous"
+      }
+    };
+
+    activeControls = await codeReader.decodeFromConstraints(
+      constraints,
+      video,
+      (result, err, controls) => {
+        if(result && !busy){
+          busy = true;
+          handleScan(result.getText().trim());
+        }
+      }
+    );
+
+    currentStream = video.srcObject;
     camError.style.display = "none";
-    scanning = true;
-    requestAnimationFrame(tick);
+
+    // Show torch button if supported
+    const track = currentStream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if(caps.torch){
+      torchBtn.style.display = "inline-block";
+    }
+
   }catch(err){
     camError.style.display = "block";
+    camError.textContent = "Camera couldn't start (" + (err.message || err) + "). Use manual entry below.";
     hintText.style.display = "none";
   }
 }
 
-function tick(){
-  if(!scanning){ return; }
-  if(video.readyState === video.HAVE_ENOUGH_DATA){
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const code = jsQR(imageData.data, imageData.width, imageData.height);
-    if(code && code.data){
-      scanning = false;
-      handleScan(code.data.trim());
-      return;
-    }
+async function toggleTorch(){
+  if(!currentStream) return;
+  const track = currentStream.getVideoTracks()[0];
+  torchOn = !torchOn;
+  try{
+    await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+    torchBtn.textContent = torchOn ? "🔦 Turn off flashlight" : "🔦 Turn on flashlight";
+  }catch(e){
+    // Some browsers/devices reject this silently - no-op
   }
-  requestAnimationFrame(tick);
 }
+torchBtn.addEventListener('click', toggleTorch);
 
 function resumeScanning(){
   resultView.style.display = "none";
   resultView.className = "";
   scanView.style.display = "flex";
-  scanning = true;
-  requestAnimationFrame(tick);
+  busy = false;
 }
 
 nextBtn.addEventListener('click', resumeScanning);
@@ -415,8 +453,8 @@ manualToggleBtn.addEventListener('click', () => {
 
 manualSubmit.addEventListener('click', () => {
   const val = manualInput.value.trim();
-  if(!val) return;
-  scanning = false;
+  if(!val || busy) return;
+  busy = true;
   handleScan(val);
   manualInput.value = "";
 });
