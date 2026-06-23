@@ -20,6 +20,8 @@
     --bad-bg:#2a1112;
     --warn:#d97706;
     --warn-bg:#2a1f0d;
+    --full:#a855f7;
+    --full-bg:#241a2e;
   }
   *{box-sizing:border-box;}
   html,body{
@@ -59,17 +61,78 @@
     font-size:17px;
     font-weight:700;
   }
-  select#busSelect{
+  #busBadge{
     background:var(--panel);
     color:var(--text);
     border:1px solid var(--line);
     border-radius:10px;
-    padding:10px 12px;
+    padding:10px 14px;
     font-size:15px;
-    font-weight:600;
-    appearance:none;
+    font-weight:700;
     min-width:108px;
     text-align:center;
+    cursor:pointer;
+  }
+  #busBadge .sub{
+    display:block;
+    font-size:11px;
+    font-weight:600;
+    color:var(--muted);
+    margin-top:2px;
+  }
+  #busBadge.full .sub{ color:var(--bad); }
+
+  /* Bus picker modal */
+  #busModal{
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,0.6);
+    display:none;
+    align-items:center;
+    justify-content:center;
+    z-index:60;
+    padding:20px;
+  }
+  #busModal .box{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:16px;
+    padding:22px;
+    width:100%;
+    max-width:320px;
+    display:flex;
+    flex-direction:column;
+    gap:12px;
+  }
+  #busModal h3{
+    margin:0 0 2px;
+    font-size:17px;
+  }
+  #busModal p{
+    margin:0;
+    color:var(--muted);
+    font-size:13px;
+    line-height:1.4;
+  }
+  #busModal input{
+    background:var(--bg);
+    border:1px solid var(--line);
+    color:var(--text);
+    border-radius:10px;
+    padding:14px;
+    font-size:18px;
+    font-weight:700;
+    text-align:center;
+    width:100%;
+  }
+  #busModal button{
+    background:var(--accent);
+    color:white;
+    border:none;
+    border-radius:10px;
+    padding:13px;
+    font-size:15px;
+    font-weight:700;
   }
   #counts{
     display:flex;
@@ -90,6 +153,8 @@
     white-space:nowrap;
   }
   .count-chip b{ color:var(--text); }
+  .count-chip.full{ border-color:var(--bad); color:var(--bad); }
+  .count-chip.full b{ color:var(--bad); }
 
   main{
     flex:1;
@@ -211,6 +276,7 @@
   #resultView.good{ background:var(--good-bg); border:1px solid var(--good); }
   #resultView.bad{ background:var(--bad-bg); border:1px solid var(--bad); }
   #resultView.warn{ background:var(--warn-bg); border:1px solid var(--warn); }
+  #resultView.full{ background:var(--full-bg); border:1px solid var(--full); }
 
   .result-icon{
     font-size:64px;
@@ -286,13 +352,20 @@
       <span class="eyebrow">TUS Trip 2026</span>
       <span class="title">Boarding Scanner</span>
     </div>
-    <select id="busSelect">
-      <option>Bus 1</option>
-      <option>Bus 2</option>
-      <option>Bus 3</option>
-      <option>Bus 4</option>
-    </select>
+    <div id="busBadge">
+      <span id="busBadgeLabel">Set bus</span>
+      <span class="sub" id="busBadgeSub">tap to choose</span>
+    </div>
   </header>
+
+  <div id="busModal">
+    <div class="box">
+      <h3 id="busModalTitle">Which bus are you scanning for?</h3>
+      <p>Type a bus number or name. New numbers are created automatically. Each bus holds a max of 50 students.</p>
+      <input id="busModalInput" type="text" placeholder="e.g. 7" autocapitalize="characters" autocomplete="off" />
+      <button id="busModalConfirm">Start scanning for this bus</button>
+    </div>
+  </div>
 
   <div id="counts"></div>
 
@@ -343,7 +416,6 @@ const resultName = document.getElementById('resultName');
 const resultSub = document.getElementById('resultSub');
 const resultId = document.getElementById('resultId');
 const nextBtn = document.getElementById('nextBtn');
-const busSelect = document.getElementById('busSelect');
 const camError = document.getElementById('camError');
 const hintText = document.getElementById('hintText');
 const loadingOverlay = document.getElementById('loadingOverlay');
@@ -353,7 +425,22 @@ const manualInput = document.getElementById('manualInput');
 const manualSubmit = document.getElementById('manualSubmit');
 const torchBtn = document.getElementById('torchBtn');
 
-let counts = { 'Bus 1':0, 'Bus 2':0, 'Bus 3':0, 'Bus 4':0 };
+const busBadge = document.getElementById('busBadge');
+const busBadgeLabel = document.getElementById('busBadgeLabel');
+const busBadgeSub = document.getElementById('busBadgeSub');
+const busModal = document.getElementById('busModal');
+const busModalTitle = document.getElementById('busModalTitle');
+const busModalInput = document.getElementById('busModalInput');
+const busModalConfirm = document.getElementById('busModalConfirm');
+
+const MAX_PER_BUS = 50;
+
+// currentBus: the bus number/name the volunteer is actively scanning for.
+// knownCounts: a cache of {busName: count} just for the chip strip at the
+// top, populated as buses get used during this session (not persisted -
+// the server's count, returned with every scan, is the source of truth).
+let currentBus = null;
+let knownCounts = {};
 let codeReader = null;
 let activeControls = null;
 let currentStream = null;
@@ -362,11 +449,69 @@ let busy = false; // prevents double-fires while a scan is being processed
 
 function renderCounts(){
   const el = document.getElementById('counts');
-  el.innerHTML = Object.entries(counts).map(([bus,n]) =>
-    `<div class="count-chip">${bus}: <b>${n}</b></div>`
+  el.innerHTML = Object.entries(knownCounts).map(([bus,n]) =>
+    `<div class="count-chip${n >= MAX_PER_BUS ? ' full' : ''}">Bus ${bus}: <b>${n}/${MAX_PER_BUS}</b></div>`
   ).join('');
 }
 renderCounts();
+
+function updateBusBadge(){
+  if(!currentBus){
+    busBadgeLabel.textContent = "Set bus";
+    busBadgeSub.textContent = "tap to choose";
+    busBadge.classList.remove('full');
+    return;
+  }
+  const count = knownCounts[currentBus] || 0;
+  busBadgeLabel.textContent = "Bus " + currentBus;
+  busBadgeSub.textContent = count + "/" + MAX_PER_BUS;
+  busBadge.classList.toggle('full', count >= MAX_PER_BUS);
+}
+
+function openBusModal(){
+  busModalTitle.textContent = currentBus
+    ? "Switch to a different bus?"
+    : "Which bus are you scanning for?";
+  busModalInput.value = currentBus || "";
+  busModal.style.display = "flex";
+  setTimeout(() => busModalInput.focus(), 50);
+}
+
+busBadge.addEventListener('click', openBusModal);
+
+busModalConfirm.addEventListener('click', async () => {
+  const val = busModalInput.value.trim();
+  if(!val) return;
+  currentBus = val;
+  busModal.style.display = "none";
+  updateBusBadge();
+  await refreshBusCount(val);
+});
+
+busModalInput.addEventListener('keydown', (e) => {
+  if(e.key === 'Enter') busModalConfirm.click();
+});
+
+// Pulls the live count for a bus from the server (used when first
+// selecting a bus, so the badge/chip isn't stuck at 0 if other
+// volunteers have already been scanning for it).
+async function refreshBusCount(bus){
+  try{
+    const url = `${SCRIPT_URL}?action=buscount&bus=${encodeURIComponent(bus)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if(data.result === "OK"){
+      knownCounts[bus] = data.count;
+      renderCounts();
+      updateBusBadge();
+    }
+  }catch(err){
+    // Non-fatal - badge just keeps showing last-known count until a scan succeeds.
+  }
+}
+
+// On load, prompt for a bus straight away so nobody scans into "no bus set".
+openBusModal();
 
 // ZXing hints: restrict to QR_CODE only for speed, and allow some tolerance
 function buildHints(){
@@ -475,8 +620,13 @@ manualSubmit.addEventListener('click', () => {
 });
 
 async function handleScan(studentId){
+  if(!currentBus){
+    busy = false;
+    openBusModal();
+    return;
+  }
   loadingOverlay.style.display = "flex";
-  const bus = busSelect.value;
+  const bus = currentBus;
   try{
     const url = `${SCRIPT_URL}?action=checkin&studentId=${encodeURIComponent(studentId)}&bus=${encodeURIComponent(bus)}`;
     const res = await fetch(url);
@@ -499,16 +649,20 @@ function showResult(data, bus){
     resultIcon.textContent = "✅";
     resultStatus.textContent = "BOARDING CONFIRMED";
     resultName.textContent = data.name || "";
-    resultSub.textContent = `${data.bus || bus} · checked in at ${data.time || ""}`;
-    counts[bus] = (counts[bus] || 0) + 1;
+    resultSub.textContent = `Bus ${data.bus || bus} · checked in at ${data.time || ""} · ${data.count}/${data.max} on this bus`;
+    knownCounts[bus] = data.count;
     renderCounts();
+    updateBusBadge();
     if(navigator.vibrate) navigator.vibrate(80);
-  } else if(data.result === "UNPAID"){
-    resultView.className = "bad";
-    resultIcon.textContent = "❌";
-    resultStatus.textContent = "PAYMENT NOT CONFIRMED";
+  } else if(data.result === "BUS_FULL"){
+    resultView.className = "full";
+    resultIcon.textContent = "🚫";
+    resultStatus.textContent = "BUS FULL";
     resultName.textContent = data.name || "";
-    resultSub.textContent = "Do not allow boarding. Send to the accommodation desk.";
+    resultSub.textContent = `Bus ${data.bus} is at ${data.count}/${data.max}. Send this student to a different bus.`;
+    knownCounts[bus] = data.count;
+    renderCounts();
+    updateBusBadge();
     if(navigator.vibrate) navigator.vibrate([60,60,60]);
   } else if(data.result === "ALREADY_BOARDED"){
     resultView.className = "warn";
